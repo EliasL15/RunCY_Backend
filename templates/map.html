@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Runner's Live Map</title>
+    <style>
+        /* Set the size of the map */
+        #map {
+            height: 100vh;
+            width: 100%;
+            margin: 0;
+            padding: 0;
+        }
+    </style>
+    <!-- Load the Google Maps JavaScript API -->
+    <script src="https://maps.googleapis.com/maps/api/js?key={{ google_maps_api_key }}"></script>
+    <script>
+        let map, marker, runnerPathLine;
+        let isRunning = false;
+        let runnerPath = JSON.parse('{{ runner_path | safe }}'); // Initial starting position array
+        let startMarker, endMarker;
+        let raceActive = true;
+
+        // Create pulsing dot symbol for live location
+        function createPulsingDot() {
+            const dotSize = 8;
+            const pulseSize = 24;
+            const svg = `
+                <svg width="${pulseSize * 2}" height="${pulseSize * 2}" xmlns="http://www.w3.org/2000/svg">
+                    <circle cx="${pulseSize}" cy="${pulseSize}" r="${pulseSize}" fill="rgba(66, 133, 244, 0.2)">
+                        <animate attributeName="r" from="${dotSize * 1.5}" to="${pulseSize}" dur="2s" begin="0s" repeatCount="indefinite"/>
+                        <animate attributeName="opacity" from="0.8" to="0" dur="2s" begin="0s" repeatCount="indefinite"/>
+                    </circle>
+                    <circle cx="${pulseSize}" cy="${pulseSize}" r="${dotSize * 1.5}" fill="rgba(66, 133, 244, 0.4)">
+                        <animate attributeName="r" from="${dotSize}" to="${dotSize * 1.5}" dur="1s" begin="0s" repeatCount="indefinite"/>
+                        <animate attributeName="opacity" from="0.8" to="0.4" dur="1s" begin="0s" repeatCount="indefinite"/>
+                    </circle>
+                    <circle cx="${pulseSize}" cy="${pulseSize}" r="${dotSize}" fill="#4285F4"/>
+                </svg>`;
+            return {
+                url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg),
+                scaledSize: new google.maps.Size(pulseSize * 2, pulseSize * 2),
+                anchor: new google.maps.Point(pulseSize, pulseSize)
+            };
+        }
+
+        function createStartEndMarkers(position, isStart) {
+            return new google.maps.Marker({
+                position: position,
+                map: map,
+                icon: {
+                    url: isStart
+                        ? "http://maps.google.com/mapfiles/ms/icons/green-dot.png"  // Green pin for start
+                        : "http://maps.google.com/mapfiles/ms/icons/red-dot.png",    // Red pin for end
+                    scaledSize: new google.maps.Size(40, 40),  // Adjust size if needed
+                },
+                title: isStart ? 'Start Position' : 'End Position',
+                zIndex: 2
+            });
+        }
+
+        function initMap() {
+            // Map centered at the starting position
+            const startPosition = runnerPath[0];
+            map = new google.maps.Map(document.getElementById('map'), {
+                zoom: 15,
+                center: startPosition
+            });
+
+            // Create start marker
+            startMarker = createStartEndMarkers(startPosition, true);
+
+            // Create the live marker with pulsing blue dot
+            marker = new google.maps.Marker({
+                position: startPosition,
+                map: map,
+                icon: createPulsingDot(),
+                title: "Runner's Live Location"
+            });
+
+            // Initialize empty polyline for the completed path
+            runnerPathLine = new google.maps.Polyline({
+                path: [startPosition],
+                geodesic: true,
+                strokeColor: '#FF0000',
+                strokeOpacity: 1.0,
+                strokeWeight: 2
+            });
+            runnerPathLine.setMap(map);
+        }
+
+        function updateRunnerPosition() {
+            // Update current location
+            fetch('/api/summary')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.current_location) {
+                        marker.setPosition(data.current_location);
+                        if (isRunning) {
+                            map.panTo(data.current_location);
+                        }
+                    }
+                })
+                .catch(error => console.error('Error fetching current location:', error));
+
+            // Update covered path
+            fetch('/api/covered_path')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.covered_path) {
+                        runnerPathLine.setPath(data.covered_path);
+                    }
+                })
+                .catch(error => console.error('Error fetching covered path:', error));
+        }
+
+
+        // Function to handle race state changes
+        function updateRaceState(state) {
+            raceActive = state;
+            if (!raceActive) {
+                // Hide live tracking marker when race is stopped
+                marker.setMap(null);
+                // Show end position marker using the last point of the runner's path
+                const path = runnerPathLine.getPath().getArray();
+                if (path.length > 0) {
+                    const endPosition = path[path.length - 1];
+                    endMarker = createStartEndMarkers(endPosition, false);
+                }
+            } else {
+                // Show live tracking marker and remove end marker when race starts
+                marker.setMap(map);
+                if (endMarker) {
+                    endMarker.setMap(null);
+                    endMarker = null;
+                }
+            }
+        }
+    </script>
+</head>
+
+<body onload="initMap()">
+    <div id="map"></div>
+    <script>
+        // Start tracking automatically when the page loads
+        window.addEventListener('load', function () {
+            isRunning = true;
+            // Update runner position every second
+            setInterval(updateRunnerPosition, 1000);
+            updateRunnerPosition(); // Initial update
+        });
+    </script>
+</body>
+
+</html>

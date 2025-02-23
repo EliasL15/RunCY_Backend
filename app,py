@@ -1,0 +1,174 @@
+from flask import Flask, render_template, jsonify
+import json
+from datetime import datetime, timedelta
+from threading import Thread
+import time
+import math
+from flask_cors import CORS
+
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut
+
+app = Flask(__name__)
+CORS(app)
+
+# Initialize runner state
+current_position = None
+covered_path = []
+start_time = datetime.now()
+
+# Global variables for caching address
+cached_address = None
+last_address_time = None
+
+def interpolate_points(point1, point2, num_points=10):
+    points = []
+    lat1, lng1 = point1['lat'], point1['lng']
+    lat2, lng2 = point2['lat'], point2['lng']
+    for i in range(num_points + 1):
+        ratio = i / num_points
+        lat = lat1 + (lat2 - lat1) * ratio + (math.sin(i) * 0.00005)
+        lng = lng1 + (lng2 - lng1) * ratio + (math.cos(i) * 0.00005)
+        points.append({"lat": lat, "lng": lng})
+    return points[:-1]  # Exclude the last point as it will be the start of the next segment
+
+# Base route points
+base_route = [
+    {"lat": 35.1667, "lng": 33.3667},  # Nicosia City Center
+    {"lat": 35.1675, "lng": 33.3685},
+    {"lat": 35.1683, "lng": 33.3700},
+    {"lat": 35.1692, "lng": 33.3720},
+    {"lat": 35.1705, "lng": 33.3745},
+    {"lat": 35.1718, "lng": 33.3765},
+    {"lat": 35.1732, "lng": 33.3782},
+    {"lat": 35.1745, "lng": 33.3798},
+    {"lat": 35.1758, "lng": 33.3815},
+    {"lat": 35.1772, "lng": 33.3830},
+    {"lat": 35.1785, "lng": 33.3845},
+    {"lat": 35.1798, "lng": 33.3860},
+    {"lat": 35.1810, "lng": 33.3875},
+    {"lat": 35.1825, "lng": 33.3890},
+    {"lat": 35.1840, "lng": 33.3905},
+    {"lat": 35.1852, "lng": 33.3920},
+    {"lat": 35.1865, "lng": 33.3935},
+    {"lat": 35.1878, "lng": 33.3950},
+    {"lat": 35.1890, "lng": 33.3965},
+    {"lat": 35.1902, "lng": 33.3980},
+    {"lat": 35.1915, "lng": 33.3995},
+    {"lat": 35.1928, "lng": 33.4010},
+    {"lat": 35.1940, "lng": 33.4025},
+    {"lat": 35.1952, "lng": 33.4040},
+    {"lat": 35.1965, "lng": 33.4055},
+    {"lat": 35.1978, "lng": 33.4070},
+    {"lat": 35.1990, "lng": 33.4085},
+    {"lat": 35.2002, "lng": 33.4100},
+    {"lat": 35.2015, "lng": 33.4115},
+    {"lat": 35.2028, "lng": 33.4130},
+    {"lat": 35.2040, "lng": 33.4145},
+    {"lat": 35.2052, "lng": 33.4160},
+    {"lat": 35.2065, "lng": 33.4175},
+    {"lat": 35.2078, "lng": 33.4190},
+    {"lat": 35.2090, "lng": 33.4205},
+    {"lat": 35.2102, "lng": 33.4220},
+    {"lat": 35.2115, "lng": 33.4235},
+    {"lat": 35.2128, "lng": 33.4250},
+    {"lat": 35.2140, "lng": 33.4265},
+    {"lat": 35.2152, "lng": 33.4280},
+    {"lat": 35.2165, "lng": 33.4295},
+    {"lat": 35.2178, "lng": 33.4310},
+    {"lat": 35.2185, "lng": 33.4325},
+    {"lat": 35.2190, "lng": 33.4340},
+    {"lat": 35.2195, "lng": 33.4355},
+    {"lat": 35.2200, "lng": 33.4367},
+    {"lat": 35.2205, "lng": 33.4375},
+    {"lat": 35.2210, "lng": 33.4385},
+    {"lat": 35.1667, "lng": 33.3667}  # Closing the loop
+]
+
+# Create detailed route
+full_route = []
+for i in range(len(base_route)):
+    current_point = base_route[i]
+    next_point = base_route[(i + 1) % len(base_route)]
+    full_route.append(current_point)
+    full_route.extend(interpolate_points(current_point, next_point))
+
+def simulate_runner():
+    global current_position, covered_path
+    current_index = 0
+    covered_path = []
+    while True:
+        current_position = full_route[current_index]
+        covered_path.append(current_position)
+        current_index = (current_index + 1) % len(full_route)
+        if current_index == 0:  # Reset path after a full loop
+            covered_path = []
+        time.sleep(2)
+
+@app.route('/')
+def index():
+    return render_template('map.html', runner_path=json.dumps([full_route[0]]))
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    R = 6371  # Earth's radius in kilometers
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    return R * c
+
+def get_address_from_coordinates(lat, lng):
+    try:
+        geolocator = Nominatim(user_agent="runner_app", timeout=10)
+        location = geolocator.reverse(f"{lat}, {lng}", language='en')
+        print(location)
+        return location.address
+        return "Address not found"
+    except GeocoderTimedOut:
+        return "Address lookup timed out"
+    except Exception:
+        return "Unable to fetch address"
+
+@app.route("/api/summary")
+def get_summary():
+    global cached_address, last_address_time
+    # Calculate the distance covered so far
+    distance = 0
+    if len(covered_path) >= 2:
+        distance = sum(
+            haversine_distance(
+                point1['lat'], point1['lng'],
+                point2['lat'], point2['lng']
+            )
+            for point1, point2 in zip(covered_path[:-1], covered_path[1:])
+        )
+    
+    # Calculate elapsed time since the start
+    time_elapsed = (datetime.now() - start_time).total_seconds()
+
+    # Update address only if one minute has passed or if there is no cached address
+    if current_position:
+        now = datetime.now()
+        if (last_address_time is None) or (now - last_address_time > timedelta(minutes=0.5)):
+            cached_address = get_address_from_coordinates(current_position['lat'], current_position['lng'])
+            last_address_time = now
+        address = cached_address
+    else:
+        address = "No current position available"
+
+    return jsonify({
+        'distance_covered': round(distance, 2),
+        'current_location': current_position,
+        'address': address,
+        'time_elapsed': time_elapsed
+    })
+
+@app.route("/api/covered_path")
+def get_covered_path():
+    return jsonify({'covered_path': covered_path})
+
+if __name__ == '__main__':
+    runner_thread = Thread(target=simulate_runner, daemon=True)
+    runner_thread.start()
+    app.run(host='0.0.0.0', port=8080, debug=True)
