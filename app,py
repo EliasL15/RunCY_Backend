@@ -1,27 +1,88 @@
-from flask import Flask, render_template, jsonify
-import json
+from flask import Flask, render_template, jsonify, request
+from flask_cors import CORS
 from datetime import datetime, timedelta
 from threading import Thread
-import time
-import math
-from flask_cors import CORS
-
+import time, math, json
+from collections import deque
+import numpy as np
+from functools import wraps
+from werkzeug.security import check_password_hash
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut
 
+from models import db, Race, GpsPoint
+
+# =============================================================================
+# Configuration and App Setup
+# =============================================================================
+from config import Config
+
 app = Flask(__name__)
+app.config.from_object(Config)
 CORS(app)
+db.init_app(app)
 
-# Initialize runner state
-current_position = None
-covered_path = []
-start_time = datetime.now()
+# =============================================================================
+# Authentication Helpers
+# =============================================================================
+def requires_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return authenticate()
+        return f(*args, **kwargs)
+    return decorated
 
-# Global variables for caching address
-cached_address = None
-last_address_time = None
+def check_auth(username, password):
+    return username == app.config['ADMIN_USERNAME'] and check_password_hash(app.config['ADMIN_PASSWORD_HASH'], password)
+
+def authenticate():
+    return (
+        'Could not verify your access level for that URL.\n'
+        'You have to login with proper credentials',
+        401,
+        {'WWW-Authenticate': 'Basic realm="Login Required"'}
+    )
+
+# =============================================================================
+# Global Constants and Runner State
+# =============================================================================
+MAX_STORED_POSITIONS = 10000
+POSITION_UPDATE_INTERVAL = 5  # seconds between updates
+DISPLAY_POINTS_THRESHOLD = 1000
+
+class RunnerState:
+    """
+    Encapsulates the in-memory runner state.
+    """
+    def __init__(self):
+        self.current_position = None
+        self.covered_path = deque(maxlen=MAX_STORED_POSITIONS)
+        self.last_position_update = None
+        self.current_race = None
+        self.cached_address = None
+        self.last_address_time = None
+        self.current_index = 0  # Global index to resume simulation
+
+runner_state = RunnerState()
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+def compress_path(path):
+    """Compress the path to a fixed number of points while maintaining its shape."""
+    if len(path) <= DISPLAY_POINTS_THRESHOLD:
+        return list(path)
+    points = np.array([[p['lat'], p['lng']] for p in path])
+    compression_ratio = DISPLAY_POINTS_THRESHOLD / len(points)
+    compressed_size = int(len(points) * compression_ratio)
+    indices = np.linspace(0, len(points) - 1, compressed_size, dtype=int)
+    compressed_points = points[indices]
+    return [{'lat': float(lat), 'lng': float(lng)} for lat, lng in compressed_points]
 
 def interpolate_points(point1, point2, num_points=10):
+    """Generate intermediate points between two coordinates."""
     points = []
     lat1, lng1 = point1['lat'], point1['lng']
     lat2, lng2 = point2['lat'], point2['lng']
@@ -30,11 +91,208 @@ def interpolate_points(point1, point2, num_points=10):
         lat = lat1 + (lat2 - lat1) * ratio + (math.sin(i) * 0.00005)
         lng = lng1 + (lng2 - lng1) * ratio + (math.cos(i) * 0.00005)
         points.append({"lat": lat, "lng": lng})
-    return points[:-1]  # Exclude the last point as it will be the start of the next segment
+    return points[:-1]  # Exclude the last point to avoid duplicates
 
-# Base route points
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """Calculate the Haversine distance (in kilometers) between two points."""
+    R = 6371  # Earth's radius in kilometers
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    return R * c
+
+def get_address_from_coordinates(lat, lng):
+    """Retrieve a human-readable address from coordinates using Nominatim."""
+    try:
+        geolocator = Nominatim(user_agent="runner_app", timeout=10)
+        location = geolocator.reverse(f"{lat}, {lng}", language='en')
+        return location.address if location else "Address not found"
+    except GeocoderTimedOut:
+        return "Address lookup timed out"
+    except Exception:
+        return "Unable to fetch address"
+
+# =============================================================================
+# Route Definitions
+# =============================================================================
+@app.route('/')
+def index():
+    # Pass the starting coordinate for the live map.
+    return render_template('map.html', runner_path=json.dumps([full_route[0]]))
+
+@app.route("/api/summary")
+def get_summary():
+    """Return a summary of the race including distance, current location, address, time elapsed, and status."""
+    if not runner_state.current_race:
+        return jsonify({
+            'distance_covered': 0,
+            'current_location': None,
+            'address': "No race in progress",
+            'time_elapsed': 0,
+            'race_active': False
+        })
+
+    if runner_state.current_race.is_active:
+        distance = 0
+        if len(runner_state.covered_path) >= 2:
+            path_list = list(runner_state.covered_path)
+            distance = sum(
+                haversine_distance(p1['lat'], p1['lng'], p2['lat'], p2['lng'])
+                for p1, p2 in zip(path_list[:-1], path_list[1:])
+            )
+        time_elapsed = (datetime.now() - runner_state.current_race.start_time).total_seconds()
+        current_loc = runner_state.current_position
+        race_active = True
+    else:
+        points = GpsPoint.query.filter_by(race_id=runner_state.current_race.id).order_by(GpsPoint.timestamp).all()
+        if points:
+            distance = sum(
+                haversine_distance(points[i].lat, points[i].lng, points[i+1].lat, points[i+1].lng)
+                for i in range(len(points)-1)
+            )
+            time_elapsed = (runner_state.current_race.end_time - runner_state.current_race.start_time).total_seconds()
+            last_point = GpsPoint.query.filter_by(race_id=runner_state.current_race.id)\
+                                       .order_by(GpsPoint.timestamp.desc()).first()
+            current_loc = {'lat': last_point.lat, 'lng': last_point.lng} if last_point else None
+        else:
+            distance = 0
+            time_elapsed = 0
+            current_loc = None
+        race_active = False
+
+    if race_active and current_loc:
+        now = datetime.now()
+        if (runner_state.last_address_time is None) or (now - runner_state.last_address_time > timedelta(minutes=0.5)):
+            runner_state.cached_address = get_address_from_coordinates(current_loc['lat'], current_loc['lng'])
+            runner_state.last_address_time = now
+        address = runner_state.cached_address
+    else:
+        address = ""
+
+    return jsonify({
+        'distance_covered': round(distance, 2),
+        'current_location': current_loc,
+        'address': address,
+        'time_elapsed': time_elapsed,
+        'race_active': race_active
+    })
+
+@app.route("/api/covered_path")
+def get_covered_path():
+    path_to_return = compress_path(runner_state.covered_path)
+    return jsonify({'covered_path': path_to_return})
+
+@app.route('/admin')
+@requires_auth
+def admin_portal():
+    db.session.expire_all()  # Ensure we fetch fresh race data
+    races = Race.query.all()
+    return render_template('admin.html', races=races)
+
+@app.route('/api/admin/race_state')
+def get_race_state():
+    """Return the current race state including whether it is active and, if ended, the final position."""
+    if runner_state.current_race:
+        if not runner_state.current_race.is_active:
+            last_point = GpsPoint.query.filter_by(race_id=runner_state.current_race.id)\
+                                       .order_by(GpsPoint.timestamp.desc()).first()
+            final_position = {'lat': last_point.lat, 'lng': last_point.lng} if last_point else None
+        else:
+            final_position = None
+        return jsonify({
+            'race_state': {
+                'is_active': runner_state.current_race.is_active,
+                'final_position': final_position
+            }
+        })
+    return jsonify({'status': 'error', 'message': 'No race found'})
+
+@app.route('/api/admin/continue_race/<int:race_id>', methods=['POST'])
+@requires_auth
+def continue_race(race_id):
+    """
+    Continue a previously ended race by reloading all GPS points from the database,
+    updating the in-memory state (including current index), and resuming the simulation.
+    """
+    race = Race.query.get_or_404(race_id)
+    if not race.is_active:
+        # Mark the race as active again.
+        race.is_active = True
+        race.end_time = None
+        db.session.commit()
+
+        # Load all stored GPS points from the database.
+        points = GpsPoint.query.filter_by(race_id=race_id).order_by(GpsPoint.timestamp).all()
+        runner_state.covered_path.clear()
+        for point in points:
+            runner_state.covered_path.append({'lat': point.lat, 'lng': point.lng})
+        if points:
+            runner_state.current_position = {'lat': points[-1].lat, 'lng': points[-1].lng}
+            # Set the simulation index based on the number of points loaded.
+            # runner_state.current_index = len(points) % len(full_route)
+        else:
+            runner_state.current_index = 0
+
+        runner_state.current_race = race
+        runner_state.last_position_update = None  # Reset to trigger an immediate update.
+        runner_thread = Thread(target=simulate_runner, daemon=True)
+        runner_thread.start()
+        return jsonify({'status': 'success', 'message': 'Race continued successfully'})
+    return jsonify({'status': 'error', 'message': 'Race is already active'})
+
+@app.route('/api/admin/end_race', methods=['POST'])
+@requires_auth
+def end_race():
+    """End the current race by recording the final GPS point and updating race status."""
+    if runner_state.current_race and runner_state.current_race.is_active:
+        with app.app_context():
+            db.session.expire_all()
+            race = Race.query.get(runner_state.current_race.id)
+            if runner_state.current_position:
+                gps_point = GpsPoint(
+                    lat=runner_state.current_position['lat'],
+                    lng=runner_state.current_position['lng'],
+                    race_id=race.id
+                )
+                db.session.add(gps_point)
+                db.session.commit()
+            race.is_active = False
+            race.end_time = datetime.utcnow()
+            db.session.commit()
+            runner_state.current_race = Race.query.get(race.id)
+        runner_state.last_position_update = None
+        return jsonify({
+            'status': 'success',
+            'message': 'Race ended successfully',
+            'race_state': {
+                'is_active': False,
+                'final_position': runner_state.current_position
+            }
+        })
+    return jsonify({'status': 'error', 'message': 'No active race found'})
+
+@app.route('/api/admin/reload_race/<int:race_id>')
+@requires_auth
+def reload_race(race_id):
+    """Reload race data from the database into memory."""
+    race = Race.query.get_or_404(race_id)
+    runner_state.covered_path.clear()
+    points = GpsPoint.query.filter_by(race_id=race_id).order_by(GpsPoint.timestamp).all()
+    for point in points:
+        runner_state.covered_path.append({'lat': point.lat, 'lng': point.lng})
+    if points:
+        runner_state.current_position = {'lat': points[-1].lat, 'lng': points[-1].lng}
+    runner_state.current_race = race
+    return jsonify({'status': 'success', 'message': f'Loaded {len(points)} points'})
+
+# =============================================================================
+# Simulation Thread
+# =============================================================================
+# Define base route points (closing the loop)
 base_route = [
-    {"lat": 35.1667, "lng": 33.3667},  # Nicosia City Center
+    {"lat": 35.1667, "lng": 33.3667},
     {"lat": 35.1675, "lng": 33.3685},
     {"lat": 35.1683, "lng": 33.3700},
     {"lat": 35.1692, "lng": 33.3720},
@@ -85,7 +343,7 @@ base_route = [
     {"lat": 35.1667, "lng": 33.3667}  # Closing the loop
 ]
 
-# Create detailed route
+# Build a detailed route by interpolating between base points.
 full_route = []
 for i in range(len(base_route)):
     current_point = base_route[i]
@@ -94,81 +352,50 @@ for i in range(len(base_route)):
     full_route.extend(interpolate_points(current_point, next_point))
 
 def simulate_runner():
-    global current_position, covered_path
-    current_index = 0
-    covered_path = []
+    """
+    Simulate the runner's movement along full_route.
+    This function uses runner_state.current_index to resume from the last recorded point.
+    """
+    with app.app_context():
+        # If there is no active race, create a new one and reset the state.
+        if runner_state.current_race is None or not runner_state.current_race.is_active:
+            runner_state.covered_path.clear()
+            runner_state.current_index = 0
+            runner_state.current_race = Race(start_time=datetime.utcnow(), is_active=True)
+            db.session.add(runner_state.current_race)
+            db.session.commit()
+        race_id = runner_state.current_race.id
+
     while True:
-        current_position = full_route[current_index]
-        covered_path.append(current_position)
-        current_index = (current_index + 1) % len(full_route)
-        if current_index == 0:  # Reset path after a full loop
-            covered_path = []
-        time.sleep(2)
+        with app.app_context():
+            db.session.expire_all()
+            race = Race.query.get(race_id)
+            if not race or not race.is_active:
+                break
 
-@app.route('/')
-def index():
-    return render_template('map.html', runner_path=json.dumps([full_route[0]]))
+        current_time = time.time()
+        if runner_state.last_position_update is None or (current_time - runner_state.last_position_update) >= POSITION_UPDATE_INTERVAL:
+            runner_state.current_position = full_route[runner_state.current_index]
+            runner_state.covered_path.append(runner_state.current_position)
+            with app.app_context():
+                gps_point = GpsPoint(
+                    lat=runner_state.current_position['lat'],
+                    lng=runner_state.current_position['lng'],
+                    race_id=race_id
+                )
+                db.session.add(gps_point)
+                db.session.commit()
+            # Increment the global index to continue from here next time.
+            runner_state.current_index = (runner_state.current_index + 1) % len(full_route)
+            runner_state.last_position_update = current_time
 
-def haversine_distance(lat1, lon1, lat2, lon2):
-    R = 6371  # Earth's radius in kilometers
-    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
-    c = 2 * math.asin(math.sqrt(a))
-    return R * c
+        time.sleep(1)
 
-def get_address_from_coordinates(lat, lng):
-    try:
-        geolocator = Nominatim(user_agent="runner_app", timeout=10)
-        location = geolocator.reverse(f"{lat}, {lng}", language='en')
-        print(location)
-        return location.address
-        return "Address not found"
-    except GeocoderTimedOut:
-        return "Address lookup timed out"
-    except Exception:
-        return "Unable to fetch address"
-
-@app.route("/api/summary")
-def get_summary():
-    global cached_address, last_address_time
-    # Calculate the distance covered so far
-    distance = 0
-    if len(covered_path) >= 2:
-        distance = sum(
-            haversine_distance(
-                point1['lat'], point1['lng'],
-                point2['lat'], point2['lng']
-            )
-            for point1, point2 in zip(covered_path[:-1], covered_path[1:])
-        )
-    
-    # Calculate elapsed time since the start
-    time_elapsed = (datetime.now() - start_time).total_seconds()
-
-    # Update address only if one minute has passed or if there is no cached address
-    if current_position:
-        now = datetime.now()
-        if (last_address_time is None) or (now - last_address_time > timedelta(minutes=0.5)):
-            cached_address = get_address_from_coordinates(current_position['lat'], current_position['lng'])
-            last_address_time = now
-        address = cached_address
-    else:
-        address = "No current position available"
-
-    return jsonify({
-        'distance_covered': round(distance, 2),
-        'current_location': current_position,
-        'address': address,
-        'time_elapsed': time_elapsed
-    })
-
-@app.route("/api/covered_path")
-def get_covered_path():
-    return jsonify({'covered_path': covered_path})
-
+# =============================================================================
+# Main Execution
+# =============================================================================
 if __name__ == '__main__':
+    # Start the simulation thread in the background.
     runner_thread = Thread(target=simulate_runner, daemon=True)
     runner_thread.start()
     app.run(host='0.0.0.0', port=8080, debug=True)
